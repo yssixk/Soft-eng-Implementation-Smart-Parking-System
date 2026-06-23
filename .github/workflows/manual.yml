@@ -30,4 +30,4 @@ jobs:
 
     - name: Run Unit Tests with xvfb
       run: |
-        xvfb-run pytest tests/test_logic.py -v
+        xvfb-run pytest test/test.py -v
