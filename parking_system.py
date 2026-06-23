@@ -18,7 +18,6 @@ Features:
 - Anti-double-tap protection
 - Gate safety timer (stays open until vehicle passes)
 
-Tech: Tkinter + SQLite (lightweight, runs on Raspberry Pi)
 """
 
 import sqlite3
