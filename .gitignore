@@ -3,3 +3,4 @@
 *.json
 *.log
 *.ignore
+__pycache__/
