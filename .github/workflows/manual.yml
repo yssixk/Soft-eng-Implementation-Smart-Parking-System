@@ -3,9 +3,9 @@ name: Smart Parking CI
 
 on:
   push:
-    branches: [ "master", "New_Module"]
+    branches: [ "master", "New_Module", "TrosBriset7530-patch-CI/CD"]
   pull_request:
-    branches: [ "main", "develop" ]
+    branches: [ "master", "TrosBriset7530-patch-CI/CD" ]
 
 jobs:
   test:
