@@ -28,6 +28,6 @@ jobs:
     - name: Install xvfb for Tkinter Headless Testing
       run: sudo apt-get install -y xvfb
 
-    - name: Run Unit Tests with xvfb
+    - name: Run Unit Tests
       run: |
-        xvfb-run pytest test/test.py -v
+        pytest test/test.py -v
