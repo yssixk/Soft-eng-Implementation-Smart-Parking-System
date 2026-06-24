@@ -8,3 +8,5 @@ backup/
 __pycache__/
 foto_plat/
 plat doc.md
+*.ignore
+__pycache__/
