@@ -8,10 +8,13 @@ import os
 import unittest
 from datetime import datetime, timedelta
 import sqlite3
+import sys
 
+
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database import calculate_fee, ParkingDB
 from config import CAR_SLOTS, MOTOR_SLOTS
-
 
 class TestParkingFee(unittest.TestCase):
     """Test suite for calculate_fee logic."""
