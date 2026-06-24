@@ -2,4 +2,9 @@
 *.jpg
 *.json
 *.log
-*.ignore
+*.gitignore
+backup/
+*.vscode
+__pycache__/
+foto_plat/
+plat doc.md
