@@ -93,3 +93,4 @@ If `parking_detector.py` fails to connect to your phone's camera stream:
 2.  **Same Network**: Ensure your PC and phone are connected to the exact same Wi-Fi SSID.
 3.  **One connection limit**: DroidCam only allows one connection at a time. Make sure the DroidCam desktop client or a web browser tab is not already using the camera.
 4.  **AP Isolation**: Some routers prevent local wireless devices from talking to each other. Check your router settings for "AP Isolation" or "Client Isolation" and disable it.
+5.  **Droid Client**: Make sure that droid client in your PC is close, you can check it in task manager.
