@@ -1,9 +1,0 @@
-*.db
-*.jpg
-*.json
-*.log
-*.ignore
-*.gitignore
-*.pyc
-pytest_cache/
-__pycache__/
