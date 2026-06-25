@@ -1,345 +1,32 @@
 #!/usr/bin/env python3
 """
-Smart Parking System
----------------------
-GUI parking management system with two-zone layout (Car + Motorcycle),
-student ID free parking, e-money payment, and gate simulation.
-
-Layout matches the real-life parking lot diagram:
-- Left:   Car Parking Only (60 slots in 2 sections)
-- Center: Service Lane
-- Right:  Motorcycle Parking Only (100 slots)
-- Bottom: Entry Gate (Ticket/Tap) and Exit Gate
-
-Features:
-- Student ID tap → free parking (rate negated)
-- E-Money / Flash Card for non-students
-- First 15 minutes free for all
-- Anti-double-tap protection
-- Gate safety timer (stays open until vehicle passes)
-
-Tech: Tkinter + SQLite (lightweight, runs on Raspberry Pi)
+Smart Parking System — GUI Layer
+----------------------------------
+ParkingApp(tk.Tk) — main application window with:
+- Car zone (left), Service lane (center), Motorcycle zone (right)
+- Entry/Exit gate simulation
+- Camera detector control panel
+- Plate detection integration at entry
+- Auto-refresh from database
 """
 
-import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 from datetime import datetime
-import math
+import threading
 import os
+import json
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parking.db")
-
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
-CAR_SLOTS = 60
-MOTOR_SLOTS = 100
-
-# Pricing (Indonesian Rupiah)
-CURRENCY = "Rp"
-GRACE_PERIOD_MINUTES = 15        # free if exit within this time
-
-CAR_RATE_FIRST_HOUR = 5000       # flat per hour
-CAR_RATE_ADDITIONAL = 5000       # same flat rate each additional hour
-
-MOTOR_RATE_FIRST_HOUR = 2000     # first hour
-MOTOR_RATE_ADDITIONAL = 3000     # each additional hour after the first
-
-# Gate safety: seconds the gate stays open for the vehicle to pass
-CAR_GATE_OPEN_DURATION = 8
-MOTOR_GATE_OPEN_DURATION = 5
-
-# Schema version – bump when DB schema changes to auto-recreate tables
-SCHEMA_VERSION = 2
-
-
-# ---------------------------------------------------------------------------
-# FEE CALCULATION
-# ---------------------------------------------------------------------------
-def calculate_fee(vehicle_type, entry_time, exit_time):
-    """Calculate parking fee based on vehicle type and duration.
-
-    Rules:
-    - First 15 minutes: FREE
-    - Car: Rp 5.000 per hour (flat), billed in whole hours (rounded up)
-    - Motorcycle: Rp 2.000 for the first hour, Rp 3.000 each additional hour
-    """
-    total_seconds = (exit_time - entry_time).total_seconds()
-    minutes = total_seconds / 60
-
-    if minutes <= GRACE_PERIOD_MINUTES:
-        return 0
-
-    hours = math.ceil(minutes / 60)  # round up to whole hours, min 1
-
-    if vehicle_type == "car":
-        return hours * CAR_RATE_FIRST_HOUR
-    else:  # motor
-        if hours <= 1:
-            return MOTOR_RATE_FIRST_HOUR
-        else:
-            return MOTOR_RATE_FIRST_HOUR + (hours - 1) * MOTOR_RATE_ADDITIONAL
-
-
-# ---------------------------------------------------------------------------
-# DATABASE LAYER
-# ---------------------------------------------------------------------------
-class ParkingDB:
-    """SQLite database with schema for two-zone parking, student IDs,
-    and e-money card tracking."""
-
-    def __init__(self, path=DB_PATH):
-        self.conn = sqlite3.connect(path)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self._init_schema()
-
-    # --- schema -----------------------------------------------------------
-    def _init_schema(self):
-        cur = self.conn.cursor()
-
-        # Schema versioning
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS schema_info (version INTEGER)"
-        )
-        cur.execute("SELECT version FROM schema_info")
-        row = cur.fetchone()
-
-        if row is None or row[0] != SCHEMA_VERSION:
-            # Wipe old tables and start fresh
-            for tbl in ("sessions", "slots", "students", "schema_info"):
-                cur.execute(f"DROP TABLE IF EXISTS {tbl}")
-
-            cur.execute("CREATE TABLE schema_info (version INTEGER)")
-            cur.execute(
-                "INSERT INTO schema_info (version) VALUES (?)",
-                (SCHEMA_VERSION,),
-            )
-
-            cur.execute("""
-                CREATE TABLE slots (
-                    slot_id   TEXT PRIMARY KEY,
-                    vehicle_type TEXT NOT NULL,
-                    occupied  INTEGER NOT NULL DEFAULT 0
-                )
-            """)
-
-            cur.execute("""
-                CREATE TABLE sessions (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    slot_id     TEXT    NOT NULL,
-                    plate       TEXT    NOT NULL,
-                    vehicle_type TEXT   NOT NULL,
-                    card_id     TEXT    NOT NULL,
-                    is_student  INTEGER NOT NULL DEFAULT 0,
-                    entry_time  TEXT    NOT NULL,
-                    exit_time   TEXT,
-                    fee         REAL
-                )
-            """)
-
-            cur.execute("""
-                CREATE TABLE students (
-                    student_id    TEXT PRIMARY KEY,
-                    name          TEXT NOT NULL,
-                    registered_at TEXT NOT NULL
-                )
-            """)
-
-            # Seed car slots C1–C60
-            for i in range(1, CAR_SLOTS + 1):
-                cur.execute(
-                    "INSERT INTO slots (slot_id, vehicle_type) VALUES (?, 'car')",
-                    (f"C{i}",),
-                )
-            # Seed motor slots M1–M100
-            for i in range(1, MOTOR_SLOTS + 1):
-                cur.execute(
-                    "INSERT INTO slots (slot_id, vehicle_type) VALUES (?, 'motor')",
-                    (f"M{i}",),
-                )
-            self.conn.commit()
-
-    # --- slot queries -----------------------------------------------------
-    def get_slots(self, vehicle_type=None):
-        cur = self.conn.cursor()
-        if vehicle_type:
-            cur.execute(
-                "SELECT slot_id, occupied FROM slots "
-                "WHERE vehicle_type = ? ORDER BY LENGTH(slot_id), slot_id",
-                (vehicle_type,),
-            )
-        else:
-            cur.execute(
-                "SELECT slot_id, occupied FROM slots "
-                "ORDER BY LENGTH(slot_id), slot_id"
-            )
-        return cur.fetchall()
-
-    def free_slot_count(self, vehicle_type=None):
-        cur = self.conn.cursor()
-        if vehicle_type:
-            cur.execute(
-                "SELECT COUNT(*) FROM slots "
-                "WHERE occupied = 0 AND vehicle_type = ?",
-                (vehicle_type,),
-            )
-        else:
-            cur.execute("SELECT COUNT(*) FROM slots WHERE occupied = 0")
-        return cur.fetchone()[0]
-
-    def first_free_slot(self, vehicle_type):
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT slot_id FROM slots "
-            "WHERE occupied = 0 AND vehicle_type = ? "
-            "ORDER BY LENGTH(slot_id), slot_id LIMIT 1",
-            (vehicle_type,),
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
-
-    # --- anti-double-tap --------------------------------------------------
-    def check_duplicate_tap(self, card_id):
-        """Return (session_id, slot_id) if this card already has an
-        active (un-exited) session, else None."""
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT id, slot_id FROM sessions "
-            "WHERE card_id = ? AND exit_time IS NULL LIMIT 1",
-            (card_id,),
-        )
-        return cur.fetchone()
-
-    # --- check-in / check-out ---------------------------------------------
-    def check_in(self, slot_id, plate, vehicle_type, card_id, is_student):
-        cur = self.conn.cursor()
-        cur.execute(
-            "UPDATE slots SET occupied = 1 WHERE slot_id = ?", (slot_id,)
-        )
-        cur.execute(
-            "INSERT INTO sessions "
-            "(slot_id, plate, vehicle_type, card_id, is_student, entry_time) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                slot_id,
-                plate.upper().strip(),
-                vehicle_type,
-                card_id,
-                1 if is_student else 0,
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-        self.conn.commit()
-
-    def active_session_by_card(self, card_id):
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT id, slot_id, plate, vehicle_type, is_student, entry_time "
-            "FROM sessions "
-            "WHERE card_id = ? AND exit_time IS NULL "
-            "ORDER BY id DESC LIMIT 1",
-            (card_id,),
-        )
-        return cur.fetchone()
-
-    def active_session_for_slot(self, slot_id):
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT id, plate, entry_time, card_id, is_student, vehicle_type "
-            "FROM sessions "
-            "WHERE slot_id = ? AND exit_time IS NULL "
-            "ORDER BY id DESC LIMIT 1",
-            (slot_id,),
-        )
-        return cur.fetchone()
-
-    def check_out_by_card(self, card_id):
-        """Check out by card/student ID.  Returns a result dict or None."""
-        session = self.active_session_by_card(card_id)
-        if not session:
-            return None
-
-        session_id, slot_id, plate, vehicle_type, is_student, entry_str = session
-        entry_time = datetime.fromisoformat(entry_str)
-        exit_time = datetime.now()
-
-        fee = 0 if is_student else calculate_fee(vehicle_type, entry_time, exit_time)
-
-        cur = self.conn.cursor()
-        cur.execute(
-            "UPDATE sessions SET exit_time = ?, fee = ? WHERE id = ?",
-            (exit_time.isoformat(timespec="seconds"), fee, session_id),
-        )
-        cur.execute(
-            "UPDATE slots SET occupied = 0 WHERE slot_id = ?", (slot_id,)
-        )
-        self.conn.commit()
-
-        return {
-            "plate": plate,
-            "slot_id": slot_id,
-            "vehicle_type": vehicle_type,
-            "is_student": bool(is_student),
-            "entry_time": entry_time,
-            "exit_time": exit_time,
-            "duration_minutes": (exit_time - entry_time).total_seconds() / 60,
-            "fee": fee,
-        }
-
-    # --- student management -----------------------------------------------
-    def is_registered_student(self, student_id):
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM students WHERE student_id = ?", (student_id,)
-        )
-        return cur.fetchone() is not None
-
-    def add_student(self, student_id, name):
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO students (student_id, name, registered_at) "
-            "VALUES (?, ?, ?)",
-            (student_id, name, datetime.now().isoformat(timespec="seconds")),
-        )
-        self.conn.commit()
-
-    def remove_student(self, student_id):
-        cur = self.conn.cursor()
-        cur.execute("DELETE FROM students WHERE student_id = ?", (student_id,))
-        self.conn.commit()
-
-    def get_students(self):
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT student_id, name, registered_at "
-            "FROM students ORDER BY student_id"
-        )
-        return cur.fetchall()
-
-    # --- history / reporting ----------------------------------------------
-    def history(self, limit=50):
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT slot_id, plate, vehicle_type, card_id, is_student, "
-            "       entry_time, exit_time, fee "
-            "FROM sessions ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-        return cur.fetchall()
-
-    def todays_revenue(self):
-        cur = self.conn.cursor()
-        today = datetime.now().strftime("%Y-%m-%d")
-        cur.execute(
-            "SELECT COALESCE(SUM(fee), 0) FROM sessions "
-            "WHERE exit_time LIKE ? AND is_student = 0",
-            (f"{today}%",),
-        )
-        return cur.fetchone()[0]
-
-    def close(self):
-        self.conn.close()
+from config import (
+    CAR_SLOTS, MOTOR_SLOTS, CURRENCY, GRACE_PERIOD_MINUTES,
+    CAR_RATE_FIRST_HOUR, CAR_RATE_ADDITIONAL,
+    MOTOR_RATE_FIRST_HOUR, MOTOR_RATE_ADDITIONAL,
+    CAR_GATE_OPEN_DURATION, MOTOR_GATE_OPEN_DURATION,
+    DIFF_THRESHOLD, OCCUPIED_PERCENT,
+    UPDATE_INTERVAL_SEC, SLOTS_CONFIG, REFERENCE_IMAGE, DB_PATH,
+    DEFAULT_DROIDCAM_URL,
+)
+from database import ParkingDB, calculate_fee
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +42,7 @@ class ParkingApp(tk.Tk):
     SLOT_OCC_CAR = "#c0392b"
     SLOT_FREE_MOTOR = "#2ecc71"
     SLOT_OCC_MOTOR = "#e74c3c"
+    SLOT_DETECTED = "#e67e22"      # amber for camera-detected
     BG = "#ecf0f1"
     HEADER_BG = "#2c3e50"
     LANE_BG = "#f39c12"
@@ -378,14 +66,21 @@ class ParkingApp(tk.Tk):
         self._entry_timer_id = None
         self._exit_timer_id = None
 
+        # detector state
+        self._detector_thread = None
+        self._detector_stop = threading.Event()
+        self._detector_running = False
+
         self._build_header()
         self._build_body()
         self._build_gates()
+        self._build_detector_panel()
         self._build_footer()
 
         self.refresh_slots()
         self.refresh_history()
         self.after(1000, self._tick)
+        self.after(3000, self._auto_refresh)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # =================================================================== #
@@ -751,6 +446,72 @@ class ParkingApp(tk.Tk):
         ).pack()
 
     # ------------------------------------------------------------------ #
+    def _build_detector_panel(self):
+        """Camera Detector control panel."""
+        panel = tk.LabelFrame(
+            self,
+            text="  \U0001f4f7  Camera Detector  ",
+            bg="#34495e",
+            fg="white",
+            font=("Helvetica", 10, "bold"),
+            padx=8,
+            pady=4,
+        )
+        panel.pack(fill="x", padx=8, pady=(0, 4))
+
+        row = tk.Frame(panel, bg="#34495e")
+        row.pack(fill="x")
+
+        # Parking camera source entry (for slot occupancy detection)
+        tk.Label(
+            row, text="Parking camera source:", bg="#34495e", fg="white",
+            font=("Helvetica", 9),
+        ).pack(side="left", padx=(0, 5))
+
+        self.occupancy_cam_url_var = tk.StringVar(value=DEFAULT_DROIDCAM_URL)
+        occ_url_entry = tk.Entry(
+            row, textvariable=self.occupancy_cam_url_var, width=35,
+            font=("Helvetica", 9),
+        )
+        occ_url_entry.pack(side="left", padx=(0, 10))
+
+        # Buttons
+        self.start_det_btn = tk.Button(
+            row, text="\u25b6 Start Detection", bg="#27ae60", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=8, pady=3,
+            command=self._start_detector,
+        )
+        self.start_det_btn.pack(side="left", padx=3)
+
+        self.stop_det_btn = tk.Button(
+            row, text="\u23f9 Stop", bg="#e74c3c", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=8, pady=3,
+            command=self._stop_detector, state="disabled",
+        )
+        self.stop_det_btn.pack(side="left", padx=3)
+
+        tk.Button(
+            row, text="\U0001f527 Calibrate", bg="#2980b9", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=8, pady=3,
+            command=self._open_calibration,
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            row, text="\U0001f4f8 Capture Ref", bg="#8e44ad", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=8, pady=3,
+            command=self._capture_reference,
+        ).pack(side="left", padx=3)
+
+
+
+        # Status label
+        self.det_status_lbl = tk.Label(
+            row, text="\U0001f534 STOPPED", bg="#34495e", fg="#e74c3c",
+            font=("Helvetica", 9, "bold"),
+        )
+        self.det_status_lbl.pack(side="right", padx=10)
+
+    # ------------------------------------------------------------------ #
     def _build_footer(self):
         ft = tk.Frame(self, bg=self.BG)
         ft.pack(fill="x", side="bottom", pady=(0, 6))
@@ -873,6 +634,142 @@ class ParkingApp(tk.Tk):
         return result[0]
 
     # =================================================================== #
+    #  PLATE INPUT DIALOG                                                    #
+    # =================================================================== #
+    def _detect_plate_dialog(self):
+        """Ask the user to type a license plate number.
+        Returns the plate string, or None if cancelled."""
+        plate = simpledialog.askstring(
+            "Plate Number", "Enter license plate number:"
+        )
+        if plate:
+            plate = plate.strip().upper()
+            if len(plate) < 2:
+                messagebox.showwarning(
+                    "Invalid Plate",
+                    "Plate number is too short. Please enter a valid plate.",
+                )
+                return None
+        return plate if plate else None
+
+    # =================================================================== #
+    #  SLOT PICKER DIALOG                                                    #
+    # =================================================================== #
+    def _pick_slot_dialog(self, vehicle_type):
+        """Show a dialog with a grid of slots. User clicks to pick one.
+        Returns the chosen slot_id, or None if cancelled.
+
+        Only shows slots of the given vehicle_type.
+        FREE slots are green and clickable; OCCUPIED slots are red/disabled.
+        """
+        dlg = tk.Toplevel(self)
+        vname = "Car" if vehicle_type == "car" else "Motorcycle"
+        dlg.title(f"\U0001f17f\ufe0f  Pick a {vname} Slot")
+        dlg.configure(bg="#2c3e50")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(True, True)
+
+        result = [None]
+
+        # Header
+        tk.Label(
+            dlg, text=f"Select a {vname} Parking Slot",
+            bg="#2c3e50", fg="white",
+            font=("Helvetica", 13, "bold"),
+        ).pack(pady=(12, 4))
+
+        tk.Label(
+            dlg, text="\u2705 Green = FREE (click to select)    \u274c Red = OCCUPIED",
+            bg="#2c3e50", fg="#bdc3c7",
+            font=("Helvetica", 9),
+        ).pack(pady=(0, 8))
+
+        # Scrollable frame
+        container = tk.Frame(dlg, bg="#2c3e50")
+        container.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+        canvas = tk.Canvas(container, bg="#2c3e50", highlightthickness=0)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg="#2c3e50")
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _scroll(event):
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        canvas.bind("<MouseWheel>", _scroll)
+        inner.bind("<MouseWheel>", _scroll)
+
+        # Get slot data from DB
+        all_slots = self.db.get_slots(vehicle_type)
+        cols = 6 if vehicle_type == "car" else 10
+
+        for idx, (slot_id, occupied) in enumerate(all_slots):
+            r, c = divmod(idx, cols)
+
+            def pick(sid=slot_id):
+                result[0] = sid
+                dlg.destroy()
+
+            if occupied:
+                # Check if there's an active session to show plate
+                session = self.db.active_session_for_slot(slot_id)
+                if session:
+                    plate = session[1]
+                    is_stu = session[4]
+                    tag = " \U0001f393" if is_stu else ""
+                    txt = f"{slot_id}\n{plate}{tag}"
+                    color = "#f39c12" if is_stu else (
+                        self.SLOT_OCC_CAR if vehicle_type == "car"
+                        else self.SLOT_OCC_MOTOR
+                    )
+                else:
+                    txt = f"{slot_id}\n\U0001f4f7 DETECTED"
+                    color = self.SLOT_DETECTED
+
+                btn = tk.Button(
+                    inner, text=txt, width=8, height=2,
+                    bg=color, fg="white", disabledforeground="#cccccc",
+                    font=("Helvetica", 7, "bold"), relief="flat",
+                    state="disabled",
+                )
+            else:
+                color = (self.SLOT_FREE_CAR if vehicle_type == "car"
+                         else self.SLOT_FREE_MOTOR)
+                btn = tk.Button(
+                    inner, text=f"{slot_id}\nFREE", width=8, height=2,
+                    bg=color, fg="white", activebackground="#1abc9c",
+                    font=("Helvetica", 7, "bold"), relief="flat",
+                    command=pick,
+                )
+
+            btn.grid(row=r, column=c, padx=2, pady=2)
+            # Enable scroll on buttons too
+            btn.bind("<MouseWheel>", _scroll)
+
+        # Cancel button
+        tk.Button(
+            dlg, text="\u274c Cancel", bg="#e74c3c", fg="white",
+            font=("Helvetica", 10, "bold"), relief="flat", padx=15, pady=6,
+            command=dlg.destroy,
+        ).pack(pady=(5, 12))
+
+        # Set window size based on content
+        if vehicle_type == "car":
+            dlg.geometry("580x500")
+        else:
+            dlg.geometry("850x550")
+
+        self.wait_window(dlg)
+        return result[0]
+
+    # =================================================================== #
     #  ENTRY FLOWS                                                          #
     # =================================================================== #
     def entry_student_tap(self):
@@ -905,17 +802,14 @@ class ParkingApp(tk.Tk):
         if not vtype:
             return
 
-        slot = self.db.first_free_slot(vtype)
-        if not slot:
-            zone = "Car" if vtype == "car" else "Motorcycle"
-            messagebox.showwarning("Full", f"No free {zone} slots available.")
+        # Plate input
+        plate = self._detect_plate_dialog()
+        if not plate:
             return
 
-        plate = simpledialog.askstring(
-            "Plate Number",
-            f"Enter vehicle plate number:\n(Assigned to slot {slot})",
-        )
-        if not plate:
+        # Let user pick their slot
+        slot = self._pick_slot_dialog(vtype)
+        if not slot:
             return
 
         self.db.check_in(slot, plate, vtype, sid, is_student=True)
@@ -955,17 +849,14 @@ class ParkingApp(tk.Tk):
         if not vtype:
             return
 
-        slot = self.db.first_free_slot(vtype)
-        if not slot:
-            zone = "Car" if vtype == "car" else "Motorcycle"
-            messagebox.showwarning("Full", f"No free {zone} slots available.")
+        # Plate input
+        plate = self._detect_plate_dialog()
+        if not plate:
             return
 
-        plate = simpledialog.askstring(
-            "Plate Number",
-            f"Enter vehicle plate number:\n(Assigned to slot {slot})",
-        )
-        if not plate:
+        # Let user pick their slot
+        slot = self._pick_slot_dialog(vtype)
+        if not slot:
             return
 
         self.db.check_in(slot, plate, vtype, card, is_student=False)
@@ -1102,6 +993,550 @@ class ParkingApp(tk.Tk):
         )
 
     # =================================================================== #
+    #  CAMERA DETECTOR INTEGRATION                                          #
+    # =================================================================== #
+    def _start_detector(self):
+        """Start parking slot occupancy detection in a background thread."""
+        if self._detector_running:
+            return
+
+        # Check prerequisites
+        if not os.path.exists(SLOTS_CONFIG):
+            messagebox.showwarning(
+                "No Slots Configured",
+                "No slot configuration found.\n"
+                "Please calibrate first using the \U0001f527 Calibrate button.",
+            )
+            return
+
+        if not os.path.exists(REFERENCE_IMAGE):
+            messagebox.showwarning(
+                "No Reference Image",
+                "No reference image found.\n"
+                "Please capture a reference image first.",
+            )
+            return
+
+        self._detector_stop.clear()
+        self._detector_running = True
+        self.start_det_btn.config(state="disabled")
+        self.stop_det_btn.config(state="normal")
+
+        # Load slot count for status display
+        try:
+            with open(SLOTS_CONFIG, "r") as f:
+                slots = json.load(f)
+            slot_count = len(slots)
+        except Exception:
+            slot_count = "?"
+
+        self.det_status_lbl.config(
+            text=f"\U0001f7e2 DETECTING ({slot_count} slots)",
+            fg="#2ecc71",
+        )
+
+        self._detector_thread = threading.Thread(
+            target=self._detector_loop, daemon=True
+        )
+        self._detector_thread.start()
+
+    def _stop_detector(self):
+        """Stop the occupancy detection thread."""
+        self._detector_stop.set()
+        self._detector_running = False
+        self.start_det_btn.config(state="normal")
+        self.stop_det_btn.config(state="disabled")
+        self.det_status_lbl.config(
+            text="\U0001f534 STOPPED", fg="#e74c3c",
+        )
+
+    def _detector_loop(self):
+        """Background thread: connect to camera, detect slot occupancy,
+        write results to parking.db periodically."""
+        import cv2
+        import numpy as np
+        import sqlite3
+        import time
+
+        source = self.occupancy_cam_url_var.get()
+
+        # Load config
+        try:
+            with open(SLOTS_CONFIG, "r") as f:
+                slots = json.load(f)
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror(
+                "Config Error", f"Cannot load slots_config.json:\n{e}"
+            ))
+            self.after(0, self._stop_detector)
+            return
+
+        reference = cv2.imread(REFERENCE_IMAGE)
+        if reference is None:
+            self.after(0, lambda: messagebox.showerror(
+                "Reference Error", "Cannot load reference.jpg"
+            ))
+            self.after(0, self._stop_detector)
+            return
+
+        ref_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
+        ref_gray = cv2.GaussianBlur(ref_gray, (21, 21), 0)
+
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            self.after(0, lambda: messagebox.showerror(
+                "Camera Error",
+                f"Cannot open camera at: {source}\n"
+                "Make sure DroidCam is running.",
+            ))
+            self.after(0, self._stop_detector)
+            return
+
+        last_db_update = 0
+
+        while not self._detector_stop.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+            statuses = {}
+            for slot in slots:
+                x1, y1 = slot["x1"], slot["y1"]
+                x2, y2 = slot["x2"], slot["y2"]
+
+                h, w = gray.shape[:2]
+                x1c, y1c = max(0, x1), max(0, y1)
+                x2c, y2c = min(w, x2), min(h, y2)
+                if x2c <= x1c or y2c <= y1c:
+                    continue
+
+                roi_ref = ref_gray[y1c:y2c, x1c:x2c]
+                roi_cur = gray[y1c:y2c, x1c:x2c]
+                if roi_ref.shape != roi_cur.shape:
+                    continue
+
+                diff = cv2.absdiff(roi_ref, roi_cur)
+                _, thresh = cv2.threshold(
+                    diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY
+                )
+                total_px = thresh.shape[0] * thresh.shape[1]
+                changed_px = cv2.countNonZero(thresh)
+                change_pct = (changed_px / total_px) * 100 if total_px > 0 else 0
+
+                statuses[slot["id"]] = change_pct > OCCUPIED_PERCENT
+
+            # Update DB periodically
+            now = time.time()
+            if (now - last_db_update) >= UPDATE_INTERVAL_SEC:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cur = conn.cursor()
+                    for slot_id, occupied in statuses.items():
+                        cur.execute(
+                            "UPDATE slots SET occupied = ? WHERE slot_id = ?",
+                            (1 if occupied else 0, slot_id),
+                        )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                last_db_update = now
+
+            time.sleep(0.05)  # ~20fps
+
+        cap.release()
+
+    def _open_calibration(self):
+        """Open a Tkinter-based calibration window.
+
+        Uses a Canvas with live camera feed for drawing slot rectangles.
+        No cv2.imshow/namedWindow needed — works with headless OpenCV.
+        """
+        import cv2
+        import time as _time
+        from PIL import Image, ImageTk
+
+        source = self.occupancy_cam_url_var.get()
+        if source.isdigit():
+            source = int(source)
+
+        # Ask for slot prefix
+        prefix = simpledialog.askstring(
+            "Slot Prefix",
+            "Enter slot ID prefix:\n"
+            "  C = Car slots (C1, C2, ...)\n"
+            "  M = Motorcycle slots (M1, M2, ...)",
+            initialvalue="C",
+        )
+        if not prefix:
+            return
+        prefix = prefix.strip().upper() or "C"
+
+        # Load existing slots
+        slots = []
+        if os.path.exists(SLOTS_CONFIG):
+            try:
+                with open(SLOTS_CONFIG, "r") as f:
+                    slots = json.load(f)
+            except Exception:
+                pass
+
+        # Find the next number for this prefix
+        existing_nums = [
+            int(s["id"][len(prefix):])
+            for s in slots
+            if s["id"].startswith(prefix) and s["id"][len(prefix):].isdigit()
+        ]
+        next_num = [max(existing_nums, default=0) + 1]
+
+        # --- Build calibration dialog ---
+        dlg = tk.Toplevel(self)
+        dlg.title("\U0001f527 Calibrate Parking Slots")
+        dlg.configure(bg="#2c3e50")
+        dlg.transient(self)
+        dlg.resizable(True, True)
+
+        # Info bar
+        info_var = tk.StringVar(value=f"Prefix: {prefix} | Slots: {len(slots)} | Drag to draw rectangles")
+        tk.Label(
+            dlg, textvariable=info_var, bg="#34495e", fg="white",
+            font=("Helvetica", 10, "bold"), anchor="w", padx=10, pady=5,
+        ).pack(fill="x")
+
+        # Canvas for camera + drawing
+        canvas = tk.Canvas(dlg, bg="#1a1a2e", width=640, height=480, cursor="crosshair")
+        canvas.pack(padx=5, pady=5)
+
+        # Button bar
+        btn_frame = tk.Frame(dlg, bg="#2c3e50")
+        btn_frame.pack(fill="x", padx=5, pady=(0, 5))
+
+        # Drawing state
+        draw_start = [None]
+        temp_rect_id = [None]
+        stop_cam = threading.Event()
+        current_frame = [None]
+        scale_info = [1.0, 0, 0]  # scale, display_w, display_h
+
+        def update_info():
+            info_var.set(
+                f"Prefix: {prefix} | Slots: {len(slots)} | "
+                f"Next: {prefix}{next_num[0]}"
+            )
+
+        def on_mouse_down(event):
+            draw_start[0] = (event.x, event.y)
+
+        def on_mouse_drag(event):
+            if draw_start[0] is None:
+                return
+            if temp_rect_id[0]:
+                canvas.delete(temp_rect_id[0])
+            temp_rect_id[0] = canvas.create_rectangle(
+                draw_start[0][0], draw_start[0][1], event.x, event.y,
+                outline="#00ffff", width=2, dash=(4, 4),
+            )
+
+        def on_mouse_up(event):
+            if draw_start[0] is None:
+                return
+            if temp_rect_id[0]:
+                canvas.delete(temp_rect_id[0])
+                temp_rect_id[0] = None
+
+            sx, sy = draw_start[0]
+            ex, ey = event.x, event.y
+            draw_start[0] = None
+
+            # Convert canvas coords back to original frame coords
+            sc = scale_info[0]
+            if sc <= 0:
+                return
+            x1 = int(min(sx, ex) / sc)
+            y1 = int(min(sy, ey) / sc)
+            x2 = int(max(sx, ex) / sc)
+            y2 = int(max(sy, ey) / sc)
+
+            # Ignore tiny accidental clicks
+            if (x2 - x1) < 15 or (y2 - y1) < 15:
+                return
+
+            slot_id = f"{prefix}{next_num[0]}"
+            slots.append({"id": slot_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+            next_num[0] += 1
+            update_info()
+
+        canvas.bind("<ButtonPress-1>", on_mouse_down)
+        canvas.bind("<B1-Motion>", on_mouse_drag)
+        canvas.bind("<ButtonRelease-1>", on_mouse_up)
+
+        def save_config():
+            with open(SLOTS_CONFIG, "w") as f:
+                json.dump(slots, f, indent=2)
+            messagebox.showinfo(
+                "Saved",
+                f"Saved {len(slots)} slot(s) to {SLOTS_CONFIG}",
+                parent=dlg,
+            )
+
+        def capture_ref():
+            if current_frame[0] is not None:
+                cv2.imwrite(REFERENCE_IMAGE, current_frame[0])
+                messagebox.showinfo(
+                    "Reference Captured",
+                    f"Reference image saved to:\n{REFERENCE_IMAGE}\n\n"
+                    "Make sure the parking lot was EMPTY!",
+                    parent=dlg,
+                )
+
+        def undo_last():
+            if slots:
+                removed = slots.pop()
+                next_num[0] -= 1
+                update_info()
+
+        def clear_all():
+            if messagebox.askyesno("Clear All", "Remove ALL slots?", parent=dlg):
+                slots.clear()
+                next_num[0] = 1
+                update_info()
+
+        tk.Button(
+            btn_frame, text="\U0001f4be Save", bg="#27ae60", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=10, pady=4,
+            command=save_config,
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            btn_frame, text="\U0001f4f8 Capture Ref", bg="#8e44ad", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=10, pady=4,
+            command=capture_ref,
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            btn_frame, text="\u21a9 Undo", bg="#e67e22", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=10, pady=4,
+            command=undo_last,
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            btn_frame, text="\U0001f5d1 Clear All", bg="#e74c3c", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=10, pady=4,
+            command=clear_all,
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            btn_frame, text="\u274c Close", bg="#7f8c8d", fg="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=10, pady=4,
+            command=dlg.destroy,
+        ).pack(side="right", padx=3)
+
+        # --- Camera feed thread ---
+        def camera_loop():
+            try:
+                cap = cv2.VideoCapture(source)
+                if not cap.isOpened():
+                    try:
+                        dlg.after(0, lambda: info_var.set(
+                            f"\u274c Cannot connect to camera at: {source}"
+                        ))
+                    except tk.TclError:
+                        pass
+                    return
+
+                # Warm up
+                for _ in range(10):
+                    cap.read()
+                    _time.sleep(0.03)
+
+                while not stop_cam.is_set():
+                    ret, frame = cap.read()
+                    if not ret:
+                        _time.sleep(0.05)
+                        continue
+
+                    current_frame[0] = frame.copy()
+                    display = frame.copy()
+
+                    # Load reference for occupancy detection
+                    ref_img = None
+                    if os.path.exists(REFERENCE_IMAGE):
+                        ref_img = cv2.imread(REFERENCE_IMAGE)
+
+                    if ref_img is not None and len(slots) > 0:
+                        # --- Occupancy detection (same logic as parking_detector.py) ---
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+                        ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+                        ref_gray = cv2.GaussianBlur(ref_gray, (21, 21), 0)
+
+                        free_count = 0
+                        occ_count = 0
+
+                        for s in slots:
+                            x1, y1, x2, y2 = s["x1"], s["y1"], s["x2"], s["y2"]
+                            fh, fw = gray.shape[:2]
+                            x1c, y1c = max(0, x1), max(0, y1)
+                            x2c, y2c = min(fw, x2), min(fh, y2)
+                            if x2c <= x1c or y2c <= y1c:
+                                continue
+
+                            roi_ref = ref_gray[y1c:y2c, x1c:x2c]
+                            roi_cur = gray[y1c:y2c, x1c:x2c]
+                            if roi_ref.shape != roi_cur.shape:
+                                continue
+
+                            diff = cv2.absdiff(roi_ref, roi_cur)
+                            _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+                            total_px = thresh.shape[0] * thresh.shape[1]
+                            changed_px = cv2.countNonZero(thresh)
+                            change_pct = (changed_px / total_px) * 100 if total_px > 0 else 0
+
+                            is_occupied = change_pct > OCCUPIED_PERCENT
+
+                            if is_occupied:
+                                occ_count += 1
+                            else:
+                                free_count += 1
+
+                            # Color: RED = occupied, GREEN = free
+                            color = (0, 0, 255) if is_occupied else (0, 200, 0)
+                            label = "OCCUPIED" if is_occupied else "FREE"
+
+                            # Semi-transparent fill
+                            overlay = display.copy()
+                            cv2.rectangle(overlay, (x1c, y1c), (x2c, y2c), color, -1)
+                            cv2.addWeighted(overlay, 0.3, display, 0.7, 0, display)
+
+                            # Border
+                            cv2.rectangle(display, (x1c, y1c), (x2c, y2c), color, 2)
+
+                            # Slot ID + status label
+                            cv2.putText(
+                                display, f"{s['id']}: {label}",
+                                (x1c, y1c - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
+                            )
+                            # Change percentage
+                            cv2.putText(
+                                display, f"{change_pct:.0f}%",
+                                (x1c + 4, y2c - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
+                            )
+
+                        # Update info bar with occupancy counts
+                        try:
+                            dlg.after(0, lambda f=free_count, o=occ_count: info_var.set(
+                                f"Prefix: {prefix} | Slots: {len(slots)} | "
+                                f"\u2705 FREE: {f}  \u274c OCC: {o} | "
+                                f"Next: {prefix}{next_num[0]}"
+                            ))
+                        except tk.TclError:
+                            pass
+                    else:
+                        # No reference — just draw green outlines
+                        for s in slots:
+                            clr = (0, 255, 0) if s["id"].startswith(prefix) else (255, 200, 0)
+                            cv2.rectangle(display, (s["x1"], s["y1"]), (s["x2"], s["y2"]), clr, 2)
+                            cv2.putText(
+                                display, s["id"], (s["x1"] + 2, s["y1"] + 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, clr, 1,
+                            )
+
+                    # Convert to Tkinter image
+                    display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+                    h, w = display_rgb.shape[:2]
+                    # Scale to fit canvas
+                    cw = canvas.winfo_width() or 640
+                    ch = canvas.winfo_height() or 480
+                    sc = min(cw / w, ch / h, 1.0)
+                    nw, nh = int(w * sc), int(h * sc)
+                    scale_info[0] = sc
+                    scale_info[1] = nw
+                    scale_info[2] = nh
+
+                    if sc < 1.0:
+                        display_rgb = cv2.resize(display_rgb, (nw, nh))
+
+                    img = Image.fromarray(display_rgb)
+                    imgtk = ImageTk.PhotoImage(image=img)
+
+                    try:
+                        canvas.imgtk = imgtk
+                        canvas.delete("bg")
+                        canvas.create_image(0, 0, anchor="nw", image=imgtk, tags="bg")
+                        canvas.tag_lower("bg")
+                    except tk.TclError:
+                        break
+
+                    _time.sleep(0.03)
+
+                cap.release()
+            except Exception:
+                pass
+
+        cam_thread = threading.Thread(target=camera_loop, daemon=True)
+        cam_thread.start()
+
+        def on_close():
+            stop_cam.set()
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+        update_info()
+        self.wait_window(dlg)
+        stop_cam.set()
+
+    def _capture_reference(self):
+        """Capture a frame from the webcam as the reference image.
+
+        DroidCam network streams need a warmup — the first few reads
+        often return empty frames, so we discard several before capturing.
+        """
+        import cv2
+        import time
+
+        source = self.occupancy_cam_url_var.get()
+        if source.isdigit():
+            source = int(source)
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            messagebox.showerror(
+                "Camera Error",
+                f"Cannot open camera at: {source}\n"
+                "Make sure DroidCam is running and the URL is correct.",
+            )
+            return
+
+        # Warm up: discard first frames while the stream buffers
+        frame = None
+        for _ in range(30):  # try up to 30 frames (~1 second)
+            ret, f = cap.read()
+            if ret and f is not None:
+                frame = f
+            time.sleep(0.03)
+
+        cap.release()
+
+        if frame is not None:
+            cv2.imwrite(REFERENCE_IMAGE, frame)
+            messagebox.showinfo(
+                "Reference Captured",
+                f"Reference image saved to:\n{REFERENCE_IMAGE}\n\n"
+                "Make sure the parking lot was EMPTY when captured!",
+            )
+        else:
+            messagebox.showerror(
+                "Capture Failed",
+                "Could not read a frame from the camera.\n"
+                "Try again — make sure DroidCam is active.",
+            )
+
+    # =================================================================== #
     #  REFRESH / STATS                                                      #
     # =================================================================== #
     def refresh_slots(self):
@@ -1112,11 +1547,21 @@ class ParkingApp(tk.Tk):
             is_car = slot_id.startswith("C")
             if occupied:
                 session = self.db.active_session_for_slot(slot_id)
-                plate = session[1] if session else "?"
-                is_stu = session[4] if session else False
-                color = self.SLOT_OCC_CAR if is_car else self.SLOT_OCC_MOTOR
-                tag = " \U0001f393" if is_stu else ""
-                btn.config(text=f"{slot_id}\n{plate}{tag}", bg=color)
+                if session:
+                    plate = session[1]
+                    is_stu = session[4]
+                    if is_stu:
+                        color = "#f39c12"  # orange for student
+                    else:
+                        color = self.SLOT_OCC_CAR if is_car else self.SLOT_OCC_MOTOR
+                    tag = " \U0001f393" if is_stu else ""
+                    btn.config(text=f"{slot_id}\n{plate}{tag}", bg=color)
+                else:
+                    # Camera-detected (no session)
+                    btn.config(
+                        text=f"{slot_id}\n\U0001f4f7 DETECTED",
+                        bg=self.SLOT_DETECTED,
+                    )
             else:
                 color = self.SLOT_FREE_CAR if is_car else self.SLOT_FREE_MOTOR
                 btn.config(text=f"{slot_id}\nFREE", bg=color)
@@ -1144,8 +1589,6 @@ class ParkingApp(tk.Tk):
     def _update_stats(self):
         cf = self.db.free_slot_count("car")
         mf = self.db.free_slot_count("motor")
-        co = CAR_SLOTS - cf
-        mo = MOTOR_SLOTS - mf
         rev = self.db.todays_revenue()
         now = datetime.now().strftime("%H:%M:%S")
         self.stats_lbl.config(
@@ -1160,6 +1603,12 @@ class ParkingApp(tk.Tk):
     def _tick(self):
         self._update_stats()
         self.after(1000, self._tick)
+
+    def _auto_refresh(self):
+        """Auto-refresh slot buttons every 3 seconds to pick up
+        changes from the background detector thread."""
+        self.refresh_slots()
+        self.after(3000, self._auto_refresh)
 
     # =================================================================== #
     #  STUDENT MANAGEMENT DIALOG                                            #
@@ -1271,14 +1720,11 @@ class ParkingApp(tk.Tk):
         return f"{h}h {m}m"
 
     def _on_close(self):
+        # Stop detector if running
+        if self._detector_running:
+            self._detector_stop.set()
         for tid in (self._entry_timer_id, self._exit_timer_id):
             if tid:
                 self.after_cancel(tid)
         self.db.close()
         self.destroy()
-
-
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    app = ParkingApp()
-    app.mainloop()

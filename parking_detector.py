@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#/usr/bin/env python3
 """
 Parking Slot Occupancy Detector
 --------------------------------
@@ -22,20 +22,15 @@ import sqlite3
 import sys
 from datetime import datetime
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(SCRIPT_DIR, "parking.db")
-SLOTS_CONFIG = os.path.join(SCRIPT_DIR, "slots_config.json")
-REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "reference.jpg")
-
-# ---------------------------------------------------------------------------
-# DEFAULT CONFIG — edit these or override at runtime
-# ---------------------------------------------------------------------------
-DEFAULT_DROIDCAM_URL = "http://192.168.0.168:4747/video"
-
-# Detection tuning
-DIFF_THRESHOLD = 30          # per-pixel brightness change to count as "different"
-OCCUPIED_PERCENT = 12        # % of ROI pixels that must differ → occupied
-UPDATE_INTERVAL_SEC = 2      # how often to push status to the database
+from config import (
+    DEFAULT_DROIDCAM_URL,
+    DIFF_THRESHOLD,
+    OCCUPIED_PERCENT,
+    UPDATE_INTERVAL_SEC,
+    DB_PATH,
+    SLOTS_CONFIG,
+    REFERENCE_IMAGE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +79,17 @@ class ParkingDetector:
     # ===================================================================== #
     #  CALIBRATION MODE                                                      #
     # ===================================================================== #
-    def calibrate(self):
+    def calibrate(self, prefix=None):
         if not self._connect():
             return
 
-        # Ask for slot ID prefix
+        # Ask for slot ID prefix (skip if pre-supplied, e.g. from GUI)
         print("\n=== CALIBRATION MODE ===")
-        print("Slot ID prefix examples: C (for car), M (for motorcycle)")
-        prefix = input("Enter slot ID prefix [C]: ").strip().upper() or "C"
+        if prefix is None:
+            print("Slot ID prefix examples: C (for car), M (for motorcycle)")
+            prefix = input("Enter slot ID prefix [C]: ").strip().upper() or "C"
+        else:
+            prefix = prefix.strip().upper() or "C"
 
         # Find the next number for this prefix
         existing_nums = [

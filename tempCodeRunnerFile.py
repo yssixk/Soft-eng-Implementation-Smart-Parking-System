@@ -1,0 +1,1 @@
+f"Plate: {plate.upper().strip()}\n"
