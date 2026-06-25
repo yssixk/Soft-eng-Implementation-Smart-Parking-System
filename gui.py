@@ -653,6 +653,123 @@ class ParkingApp(tk.Tk):
         return plate if plate else None
 
     # =================================================================== #
+    #  SLOT PICKER DIALOG                                                    #
+    # =================================================================== #
+    def _pick_slot_dialog(self, vehicle_type):
+        """Show a dialog with a grid of slots. User clicks to pick one.
+        Returns the chosen slot_id, or None if cancelled.
+
+        Only shows slots of the given vehicle_type.
+        FREE slots are green and clickable; OCCUPIED slots are red/disabled.
+        """
+        dlg = tk.Toplevel(self)
+        vname = "Car" if vehicle_type == "car" else "Motorcycle"
+        dlg.title(f"\U0001f17f\ufe0f  Pick a {vname} Slot")
+        dlg.configure(bg="#2c3e50")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(True, True)
+
+        result = [None]
+
+        # Header
+        tk.Label(
+            dlg, text=f"Select a {vname} Parking Slot",
+            bg="#2c3e50", fg="white",
+            font=("Helvetica", 13, "bold"),
+        ).pack(pady=(12, 4))
+
+        tk.Label(
+            dlg, text="\u2705 Green = FREE (click to select)    \u274c Red = OCCUPIED",
+            bg="#2c3e50", fg="#bdc3c7",
+            font=("Helvetica", 9),
+        ).pack(pady=(0, 8))
+
+        # Scrollable frame
+        container = tk.Frame(dlg, bg="#2c3e50")
+        container.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+        canvas = tk.Canvas(container, bg="#2c3e50", highlightthickness=0)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg="#2c3e50")
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _scroll(event):
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        canvas.bind("<MouseWheel>", _scroll)
+        inner.bind("<MouseWheel>", _scroll)
+
+        # Get slot data from DB
+        all_slots = self.db.get_slots(vehicle_type)
+        cols = 6 if vehicle_type == "car" else 10
+
+        for idx, (slot_id, occupied) in enumerate(all_slots):
+            r, c = divmod(idx, cols)
+
+            def pick(sid=slot_id):
+                result[0] = sid
+                dlg.destroy()
+
+            if occupied:
+                # Check if there's an active session to show plate
+                session = self.db.active_session_for_slot(slot_id)
+                if session:
+                    plate = session[1]
+                    is_stu = session[4]
+                    tag = " \U0001f393" if is_stu else ""
+                    txt = f"{slot_id}\n{plate}{tag}"
+                    color = "#f39c12" if is_stu else (
+                        self.SLOT_OCC_CAR if vehicle_type == "car"
+                        else self.SLOT_OCC_MOTOR
+                    )
+                else:
+                    txt = f"{slot_id}\n\U0001f4f7 DETECTED"
+                    color = self.SLOT_DETECTED
+
+                btn = tk.Button(
+                    inner, text=txt, width=8, height=2,
+                    bg=color, fg="white", disabledforeground="#cccccc",
+                    font=("Helvetica", 7, "bold"), relief="flat",
+                    state="disabled",
+                )
+            else:
+                color = (self.SLOT_FREE_CAR if vehicle_type == "car"
+                         else self.SLOT_FREE_MOTOR)
+                btn = tk.Button(
+                    inner, text=f"{slot_id}\nFREE", width=8, height=2,
+                    bg=color, fg="white", activebackground="#1abc9c",
+                    font=("Helvetica", 7, "bold"), relief="flat",
+                    command=pick,
+                )
+
+            btn.grid(row=r, column=c, padx=2, pady=2)
+            # Enable scroll on buttons too
+            btn.bind("<MouseWheel>", _scroll)
+
+        # Cancel button
+        tk.Button(
+            dlg, text="\u274c Cancel", bg="#e74c3c", fg="white",
+            font=("Helvetica", 10, "bold"), relief="flat", padx=15, pady=6,
+            command=dlg.destroy,
+        ).pack(pady=(5, 12))
+
+        # Set window size based on content
+        if vehicle_type == "car":
+            dlg.geometry("580x500")
+        else:
+            dlg.geometry("850x550")
+
+        self.wait_window(dlg)
+        return result[0]
+
+    # =================================================================== #
     #  ENTRY FLOWS                                                          #
     # =================================================================== #
     def entry_student_tap(self):
@@ -685,15 +802,14 @@ class ParkingApp(tk.Tk):
         if not vtype:
             return
 
-        slot = self.db.first_free_slot(vtype)
-        if not slot:
-            zone = "Car" if vtype == "car" else "Motorcycle"
-            messagebox.showwarning("Full", f"No free {zone} slots available.")
-            return
-
-        # Plate detection via camera
+        # Plate input
         plate = self._detect_plate_dialog()
         if not plate:
+            return
+
+        # Let user pick their slot
+        slot = self._pick_slot_dialog(vtype)
+        if not slot:
             return
 
         self.db.check_in(slot, plate, vtype, sid, is_student=True)
@@ -733,15 +849,14 @@ class ParkingApp(tk.Tk):
         if not vtype:
             return
 
-        slot = self.db.first_free_slot(vtype)
-        if not slot:
-            zone = "Car" if vtype == "car" else "Motorcycle"
-            messagebox.showwarning("Full", f"No free {zone} slots available.")
-            return
-
-        # Plate detection via camera
+        # Plate input
         plate = self._detect_plate_dialog()
         if not plate:
+            return
+
+        # Let user pick their slot
+        slot = self._pick_slot_dialog(vtype)
+        if not slot:
             return
 
         self.db.check_in(slot, plate, vtype, card, is_student=False)
